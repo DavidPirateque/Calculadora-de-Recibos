@@ -144,6 +144,7 @@ def parse_pdf_file(filename: str, file_bytes: bytes):
 # -------------------------------------------------------------
 
 PISOS = ["Piso 1", "Piso 2", "Piso 3", "Piso 4"]
+PERSONAS_DEFECTO = [2, 4, 2, 1]
 METODOS = ["Porcentaje", "Por persona (promedio)"]
 
 # Configuración por defecto de cada servicio (se puede cambiar en la página)
@@ -330,20 +331,11 @@ with col_izq:
     inc_gas = st.checkbox("Incluir Gas", value=(val_gas > 0))
     inc_ag = st.checkbox("Incluir Agua", value=(val_agua > 0))
 
-    st.write("#### Personas por piso:")
-    p_c1, p_c2 = st.columns(2)
-    with p_c1:
-        p1_pers = st.number_input("Piso 1 - Personas", value=2, min_value=0)
-        p3_pers = st.number_input("Piso 3 - Personas", value=2, min_value=0)
-    with p_c2:
-        p2_pers = st.number_input("Piso 2 - Personas", value=4, min_value=0)
-        p4_pers = st.number_input("Piso 4 - Personas", value=1, min_value=0)
-    personas = [p1_pers, p2_pers, p3_pers, p4_pers]
-
     st.write("#### Método de cálculo por servicio:")
     st.caption("El Aseo no se configura: siempre se divide en partes iguales entre los 4 pisos.")
     metodos = {}
     porcentajes = {}
+    personas_servicio = {}
     for nombre, cfg in SERVICIOS.items():
         with st.expander(nombre, expanded=True):
             metodo = st.radio(
@@ -354,6 +346,7 @@ with col_izq:
                 key=f"metodo_{nombre}",
             )
             metodos[nombre] = metodo
+            personas_servicio[nombre] = PERSONAS_DEFECTO
             if metodo == "Porcentaje":
                 cols = st.columns(4)
                 pcts = []
@@ -373,10 +366,20 @@ with col_izq:
                 porcentajes[nombre] = pcts
             else:
                 porcentajes[nombre] = cfg["pct"]
-                if sum(personas) == 0:
+                cols = st.columns(4)
+                pers = []
+                for i, piso in enumerate(PISOS):
+                    with cols[i]:
+                        pers.append(int(st.number_input(
+                            f"{piso} (personas)",
+                            min_value=0, value=PERSONAS_DEFECTO[i], step=1,
+                            key=f"pers_{nombre}_{i}",
+                        )))
+                personas_servicio[nombre] = pers
+                if sum(pers) == 0:
                     st.warning("Pon al menos una persona en algún piso.")
                 else:
-                    st.caption("Se divide el total entre las personas de la casa y se multiplica por las personas de cada piso.")
+                    st.caption(f"Total: {sum(pers)} personas. Se divide el recibo entre ellas y se multiplica por las personas de cada piso.")
 
     with st.expander("⚙️ Modificar valores manualmente si se requiere"):
         val_energia = st.number_input("Editar Energía (COP)", value=float(val_energia), step=500.0)
@@ -389,7 +392,7 @@ with col_der:
 
     totales = {"Gas": val_gas, "Energía": val_energia, "Agua": val_agua}
     resultados = {
-        nombre: calc_servicio(totales[nombre], metodos[nombre], porcentajes[nombre], personas, SERVICIOS[nombre]["umbral"])
+        nombre: calc_servicio(totales[nombre], metodos[nombre], porcentajes[nombre], personas_servicio[nombre], SERVICIOS[nombre]["umbral"])
         for nombre in SERVICIOS
     }
 
