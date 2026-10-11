@@ -18,8 +18,8 @@ from PIL import Image, ImageDraw, ImageFont
 # -------------------------------------------------------------
 
 def round_cop(val: float, umbral: int = 25) -> int:
-    """Redondea a la base $50, igual que las fórmulas del Excel original:
-    si las dos últimas cifras >= umbral, redondea hacia arriba; si no, hacia abajo.
+    """Redondea a la base $50 como las fórmulas del Excel: si las dos últimas
+    cifras >= umbral sube a la base $50 siguiente; si no, baja.
     Gas y Agua usan umbral=20; Energía y Aseo usan umbral=25."""
     if val <= 0:
         return 0
@@ -33,7 +33,6 @@ def format_cop(val: float) -> str:
     return f"$ {int(val):,}".replace(",", ".")
 
 def clean_amount(s: str) -> float:
-    """Limpia cadenas numéricas eliminando decimales tipo ,00."""
     if not s:
         return 0.0
     s_clean = re.sub(r',\d{1,2}$', '', str(s).strip())
@@ -41,7 +40,7 @@ def clean_amount(s: str) -> float:
     return float(digits_only) if digits_only else 0.0
 
 def find_cop_amounts(text: str):
-    """Encuentra montos con formato de moneda en pesos colombianos (respaldo)."""
+    """Montos con formato de pesos colombianos (solo como respaldo)."""
     matches = re.findall(r'(?:\$\s*)?([1-9]\d{1,2}[\.,]\d{3}(?:[\.,]\d{3})?(?:,\d{2})?)', text)
     nums = []
     for m in matches:
@@ -51,7 +50,6 @@ def find_cop_amounts(text: str):
     return nums
 
 def extract_date(text: str) -> str:
-    """Extrae la fecha de pago oportuno o vencimiento."""
     m = re.search(r'(?:pago\s+oportuno|pague\s+hasta|vencimiento).{0,35}?([0-9]{1,2}[\s\/\-\.][a-zA-Z]{3,4}[\s\/\-\.][0-9]{4}|[a-zA-Z]{3,4}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})', text, re.IGNORECASE | re.DOTALL)
     if m:
         return m.group(1).strip()
@@ -60,22 +58,15 @@ def extract_date(text: str) -> str:
         return m2.group(1).strip()
     return ""
 
-# -------------------------------------------------------------
-# 1b. TOTAL REAL: código de barras GS1-128, AI (3900) = valor a pagar
-#     Toda factura electrónica de servicios públicos en Colombia lo trae en
-#     texto plano, sin importar cómo esté diagramada la factura visualmente.
-#     Es mucho más confiable que buscar "Total a pagar" cerca de un número,
-#     porque esas etiquetas suelen ser gráficas y no texto extraíble.
-# -------------------------------------------------------------
-
+# Total real: código de barras GS1-128, AI (3900) = valor a pagar. Toda factura
+# electrónica de servicios públicos en Colombia lo trae en texto plano.
 def extract_barcode_total(text: str):
     m = re.search(r'\(3900\)0*(\d+)', text)
     return int(m.group(1)) if m else None
 
+# En Enel Bogotá el total de Aseo se repite en "INFORMATIVO DEUDA TOTAL: 84,740.00"
+# (formato con coma de miles). Energía = Total factura - Aseo.
 def extract_aseo_enel(text: str):
-    """En las facturas Enel de Bogotá, el total de Aseo se repite en una línea fija:
-    'INFORMATIVO DEUDA TOTAL: 84,740.00' (formato con coma de miles), justo
-    después del bloque de Aseo. Energía = Total factura - Aseo."""
     m = re.search(r'INFORMATIVO DEUDA TOTAL:?\s*([\d.,]+)\.\d{2}', text, re.IGNORECASE)
     if not m:
         return None
@@ -149,12 +140,44 @@ def parse_pdf_file(filename: str, file_bytes: bytes):
     return res
 
 # -------------------------------------------------------------
-# 3. GENERADOR DINÁMICO DE TARJETAS PARA WHATSAPP
+# 3. CÁLCULO POR SERVICIO (porcentaje o por persona)
+# -------------------------------------------------------------
+
+PISOS = ["Piso 1", "Piso 2", "Piso 3", "Piso 4"]
+METODOS = ["Porcentaje", "Por persona (promedio)"]
+
+# Configuración por defecto de cada servicio (se puede cambiar en la página)
+SERVICIOS = {
+    "Gas":     {"umbral": 20, "metodo": "Porcentaje",             "pct": [20.0, 50.0, 30.0, 0.0]},
+    "Energía": {"umbral": 25, "metodo": "Porcentaje",             "pct": [21.5, 42.0, 15.0, 21.5]},
+    "Agua":    {"umbral": 20, "metodo": "Por persona (promedio)", "pct": [25.0, 25.0, 25.0, 25.0]},
+}
+
+# Texto especial que se antepone al valor de Energía cuando se calcula por porcentaje
+EXTRA_ENERGIA = {"Piso 1": "ENERGÍA Y DUCHA = "}
+
+def calc_servicio(total: float, metodo: str, pcts: list, personas: list, umbral: int):
+    """Devuelve, para cada piso, (valor_redondeado, detalle, texto_valor, centrado)."""
+    tot_p = sum(personas)
+    c_unit = (total / tot_p) if tot_p > 0 else 0
+    salida = []
+    for i in range(4):
+        if metodo == "Porcentaje":
+            raw = round_cop(total * pcts[i] / 100.0, umbral)
+            salida.append((raw, "CALCULADO POR PORCENTAJE", format_cop(raw), False))
+        else:
+            raw = round_cop(personas[i] * c_unit, umbral)
+            n = personas[i]
+            etiqueta = "PERSONA" if n == 1 else "PERSONAS"
+            salida.append((raw, f"POR PERSONA = $ {int(c_unit)}", f"{n} {etiqueta} = {format_cop(raw)}", True))
+    return salida
+
+# -------------------------------------------------------------
+# 4. GENERADOR DINÁMICO DE TARJETAS PARA WHATSAPP
 # -------------------------------------------------------------
 
 def load_font(size: int, bold: bool = False):
-    """Busca una fuente utilizable tanto en Windows (uso local) como en Linux
-    (Streamlit Community Cloud y otros hostings), con Pillow por defecto al final."""
+    """Fuente utilizable en Windows (local) y Linux (Streamlit Cloud con packages.txt)."""
     candidates = [
         os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "arialbd.ttf" if bold else "arial.ttf"),
         os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "calibrib.ttf" if bold else "calibri.ttf"),
@@ -215,7 +238,7 @@ def render_dynamic_card(piso_name, fecha_pago, services_items):
 
         draw.text((c0 + (c1 - c0 - draw.textlength(s["name"], font=font_bold)) // 2, y + 9), s["name"], fill="black", font=font_bold)
 
-        if s["name"] in ["Aseo", "Agua"]:
+        if s.get("center", False):
             draw.text((c1 + (c2 - c1 - draw.textlength(s["detail"], font=font_reg)) // 2, y + 9), s["detail"], fill="black", font=font_reg)
         else:
             draw.text((c1 + 20, y + 9), s["detail"], fill="black", font=font_reg)
@@ -234,7 +257,7 @@ def render_dynamic_card(piso_name, fecha_pago, services_items):
     return img
 
 # -------------------------------------------------------------
-# 4. INTERFAZ STREAMLIT
+# 5. INTERFAZ STREAMLIT
 # -------------------------------------------------------------
 
 st.set_page_config(page_title="ServiciosHogar - Cuentas de Cobro", layout="wide")
@@ -307,7 +330,7 @@ with col_izq:
     inc_gas = st.checkbox("Incluir Gas", value=(val_gas > 0))
     inc_ag = st.checkbox("Incluir Agua", value=(val_agua > 0))
 
-    st.write("#### Censo de Agua por Piso (Personas):")
+    st.write("#### Personas por piso:")
     p_c1, p_c2 = st.columns(2)
     with p_c1:
         p1_pers = st.number_input("Piso 1 - Personas", value=2, min_value=0)
@@ -315,52 +338,85 @@ with col_izq:
     with p_c2:
         p2_pers = st.number_input("Piso 2 - Personas", value=4, min_value=0)
         p4_pers = st.number_input("Piso 4 - Personas", value=1, min_value=0)
+    personas = [p1_pers, p2_pers, p3_pers, p4_pers]
 
-    tot_p = p1_pers + p2_pers + p3_pers + p4_pers
-    c_unit_agua = (val_agua / tot_p) if tot_p > 0 else 0
-    pers_dict = {"Piso 1": p1_pers, "Piso 2": p2_pers, "Piso 3": p3_pers, "Piso 4": p4_pers}
+    st.write("#### Método de cálculo por servicio:")
+    st.caption("El Aseo no se configura: siempre se divide en partes iguales entre los 4 pisos.")
+    metodos = {}
+    porcentajes = {}
+    for nombre, cfg in SERVICIOS.items():
+        with st.expander(nombre, expanded=True):
+            metodo = st.radio(
+                f"Método para {nombre}",
+                METODOS,
+                index=METODOS.index(cfg["metodo"]),
+                horizontal=True,
+                key=f"metodo_{nombre}",
+            )
+            metodos[nombre] = metodo
+            if metodo == "Porcentaje":
+                cols = st.columns(4)
+                pcts = []
+                for i, piso in enumerate(PISOS):
+                    with cols[i]:
+                        pcts.append(st.number_input(
+                            f"{piso} (%)",
+                            min_value=0.0, max_value=100.0,
+                            value=float(cfg["pct"][i]), step=0.5,
+                            key=f"pct_{nombre}_{i}",
+                        ))
+                suma = sum(pcts)
+                if abs(suma - 100.0) > 0.01:
+                    st.warning(f"Los porcentajes suman {suma:.1f}% (deberían sumar 100%).")
+                else:
+                    st.caption(f"Suma: {suma:.1f}% ✓")
+                porcentajes[nombre] = pcts
+            else:
+                porcentajes[nombre] = cfg["pct"]
+                if sum(personas) == 0:
+                    st.warning("Pon al menos una persona en algún piso.")
+                else:
+                    st.caption("Se divide el total entre las personas de la casa y se multiplica por las personas de cada piso.")
 
     with st.expander("⚙️ Modificar valores manualmente si se requiere"):
         val_energia = st.number_input("Editar Energía (COP)", value=float(val_energia), step=500.0)
         val_aseo = st.number_input("Editar Aseo (COP)", value=float(val_aseo), step=500.0)
         val_gas = st.number_input("Editar Gas (COP)", value=float(val_gas), step=500.0)
         val_agua = st.number_input("Editar Agua (COP)", value=float(val_agua), step=1000.0)
-        c_unit_agua = (val_agua / tot_p) if tot_p > 0 else 0
 
 with col_der:
     st.subheader("2. Cuentas de Cobro para WhatsApp")
 
-    pisos_config = {
-        "Piso 1": {"pct_e": 0.215, "pct_g": 0.20, "extra": ""},
-        "Piso 2": {"pct_e": 0.420, "pct_g": 0.50, "extra": ""},
-        "Piso 3": {"pct_e": 0.150, "pct_g": 0.30, "extra": ""},
-        "Piso 4": {"pct_e": 0.215, "pct_g": 0.00, "extra": ""},
+    totales = {"Gas": val_gas, "Energía": val_energia, "Agua": val_agua}
+    resultados = {
+        nombre: calc_servicio(totales[nombre], metodos[nombre], porcentajes[nombre], personas, SERVICIOS[nombre]["umbral"])
+        for nombre in SERVICIOS
     }
 
     cards = {}
-    for piso, cfg in pisos_config.items():
+    for idx, piso in enumerate(PISOS):
         items = []
 
         if inc_gas:
-            g_raw = round_cop(val_gas * cfg["pct_g"], umbral=20)
-            items.append({"name": "Gas", "color": "#0000FF", "detail": "CALCULADO POR PORCENTAJE",
-                          "val_str": format_cop(g_raw), "raw_val": g_raw})
+            raw, detalle, texto, centro = resultados["Gas"][idx]
+            items.append({"name": "Gas", "color": "#0000FF", "detail": detalle,
+                          "val_str": texto, "raw_val": raw, "center": centro})
 
         if inc_ey:
-            e_raw = round_cop(val_energia * cfg["pct_e"], umbral=25)
-            e_lbl = f"{cfg['extra']}{format_cop(e_raw)}" if cfg["extra"] else format_cop(e_raw)
-            items.append({"name": "Energía", "color": "#FFFF00", "detail": "CALCULADO POR PORCENTAJE",
-                          "val_str": e_lbl, "raw_val": e_raw})
+            raw, detalle, texto, centro = resultados["Energía"][idx]
+            if metodos["Energía"] == "Porcentaje" and EXTRA_ENERGIA.get(piso):
+                texto = f"{EXTRA_ENERGIA[piso]}{texto}"
+            items.append({"name": "Energía", "color": "#FFFF00", "detail": detalle,
+                          "val_str": texto, "raw_val": raw, "center": centro})
 
             a_raw = round_cop(val_aseo / 4.0, umbral=25)
             items.append({"name": "Aseo", "color": "#FFFF00", "detail": "POR PISO",
-                          "val_str": format_cop(a_raw), "raw_val": a_raw})
+                          "val_str": format_cop(a_raw), "raw_val": a_raw, "center": True})
 
         if inc_ag:
-            ag_raw = round_cop(pers_dict[piso] * c_unit_agua, umbral=20)
-            p_text = f"{pers_dict[piso]} PERSONAS = {format_cop(ag_raw)}" if pers_dict[piso] != 1 else f"{pers_dict[piso]} PERSONA = {format_cop(ag_raw)}"
-            items.append({"name": "Agua", "color": "#00CCFF", "detail": f"POR PERSONA = $ {int(c_unit_agua)}",
-                          "val_str": p_text, "raw_val": ag_raw})
+            raw, detalle, texto, centro = resultados["Agua"][idx]
+            items.append({"name": "Agua", "color": "#00CCFF", "detail": detalle,
+                          "val_str": texto, "raw_val": raw, "center": centro})
 
         cards[piso] = render_dynamic_card(piso, fecha_val, items)
 
@@ -377,26 +433,26 @@ with col_der:
         data=zip_buffer.getvalue(),
         file_name="Cuentas_de_Cobro_Todos_los_Pisos.zip",
         mime="application/zip",
-        use_container_width=True
+        width="stretch"
     )
 
     st.write("")
 
     cp1, cp2 = st.columns(2)
     with cp1:
-        st.image(cards["Piso 1"], use_container_width=True)
+        st.image(cards["Piso 1"], width="stretch")
         buf1 = io.BytesIO(); cards["Piso 1"].save(buf1, format="PNG")
         st.download_button("📥 Descargar Piso 1 (PNG)", data=buf1.getvalue(), file_name="Cuenta_Cobro_Piso_1.png", mime="image/png")
 
-        st.image(cards["Piso 3"], use_container_width=True)
+        st.image(cards["Piso 3"], width="stretch")
         buf3 = io.BytesIO(); cards["Piso 3"].save(buf3, format="PNG")
         st.download_button("📥 Descargar Piso 3 (PNG)", data=buf3.getvalue(), file_name="Cuenta_Cobro_Piso_3.png", mime="image/png")
 
     with cp2:
-        st.image(cards["Piso 2"], use_container_width=True)
+        st.image(cards["Piso 2"], width="stretch")
         buf2 = io.BytesIO(); cards["Piso 2"].save(buf2, format="PNG")
         st.download_button("📥 Descargar Piso 2 (PNG)", data=buf2.getvalue(), file_name="Cuenta_Cobro_Piso_2.png", mime="image/png")
 
-        st.image(cards["Piso 4"], use_container_width=True)
+        st.image(cards["Piso 4"], width="stretch")
         buf4 = io.BytesIO(); cards["Piso 4"].save(buf4, format="PNG")
         st.download_button("📥 Descargar Piso 4 (PNG)", data=buf4.getvalue(), file_name="Cuenta_Cobro_Piso_4.png", mime="image/png")
