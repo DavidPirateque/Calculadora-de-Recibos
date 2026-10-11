@@ -9,6 +9,8 @@ import os
 import re
 import math
 import zipfile
+import unicodedata
+from datetime import date, datetime, timedelta, timezone
 import pypdf
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
@@ -58,6 +60,76 @@ def extract_date(text: str) -> str:
         return m2.group(1).strip()
     return ""
 
+# -------------------------------------------------------------
+# 1a. FECHAS: lectura de la fecha de pago oportuno y fecha límite a mostrar
+# -------------------------------------------------------------
+
+MESES = {"ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8,
+         "sep": 9, "set": 9, "oct": 10, "nov": 11, "dic": 12}
+MESES_ABR = ["Ene.", "Feb.", "Mar.", "Abr.", "May.", "Jun.", "Jul.", "Ago.", "Sep.", "Oct.", "Nov.", "Dic."]
+
+def hoy_bogota() -> date:
+    """Fecha de hoy en Colombia (UTC-5, sin horario de verano), aunque el servidor esté en otra zona."""
+    return datetime.now(timezone(timedelta(hours=-5))).date()
+
+def _mes_num(txt: str):
+    t = unicodedata.normalize("NFD", txt.lower())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    return MESES.get(t[:3])
+
+def parse_fecha(txt: str):
+    """Convierte '10 Sep. 2026', '21 SEP /2026', 'SEP/30/2026' o '15/10/2026' en date. None si no puede."""
+    if not txt:
+        return None
+    try:
+        m = re.search(r'([A-Za-z]{3,4})/(\d{1,2})/(\d{4})', txt)          # SEP/30/2026
+        if m and _mes_num(m.group(1)):
+            return date(int(m.group(3)), _mes_num(m.group(1)), int(m.group(2)))
+        m = re.search(r'(\d{1,2})\s*([A-Za-z]{3,4})\.?\s*/?\s*(\d{4})', txt)  # 10 Sep. 2026 / 21 SEP /2026
+        if m and _mes_num(m.group(2)):
+            return date(int(m.group(3)), _mes_num(m.group(2)), int(m.group(1)))
+        m = re.search(r'(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})', txt)       # 15/10/2026 (día/mes/año)
+        if m:
+            anio = int(m.group(3))
+            anio = anio + 2000 if anio < 100 else anio
+            return date(anio, int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        return None
+    return None
+
+def format_fecha(d: date) -> str:
+    return f"{d.day} {MESES_ABR[d.month - 1]} {d.year}"
+
+# En cada empresa, la fecha de pago oportuno aparece en una posición fija del recibo:
+#   Enel:      "$257.280  21 SEP /2026  (pago oportuno)  23 SEP/2026  (suspensión)"
+#   Acueducto: "JUN/25/2026 - AGO/22/2026  SEP/30/2026 (pago oportuno)  OCT/05/2026 (suspensión)"
+#   Vanti:     "10 Sep. 2026 (pago oportuno)  11 Sep. 2026 (suspensión)  Jul. - Ago. 2026 (período)"
+PATRON_FECHA_PAGO = {
+    "ENERGIA": r'\$\s*[\d.]+\s+(\d{1,2}\s*[A-Za-z]{3,4}\s*/\s*\d{4})',
+    "AGUA": r'[A-Za-z]{3}/\d{1,2}/\d{4}\s*-\s*[A-Za-z]{3}/\d{1,2}/\d{4}\s+([A-Za-z]{3}/\d{1,2}/\d{4})',
+    "GAS": r'(\d{1,2}\s+[A-Za-z]{3,4}\.?\s+\d{4})\s+\d{1,2}\s+[A-Za-z]{3,4}\.?\s+\d{4}\s+[A-Za-z]{3,4}\.?\s*-\s*[A-Za-z]{3,4}\.?\s+\d{4}',
+}
+
+def extract_fecha_pago(service: str, text: str):
+    patron = PATRON_FECHA_PAGO.get(service)
+    if patron:
+        m = re.search(patron, text)
+        if m:
+            d = parse_fecha(m.group(1))
+            if d:
+                return d
+    return parse_fecha(extract_date(text))   # respaldo por etiqueta
+
+def calcular_fecha_limite(fechas: list, hoy: date):
+    """Regla: se toma el vencimiento más próximo entre los recibos cargados. Si ya pasó
+    (o no hay fechas), la fecha límite es hoy + 3 días. Devuelve (fecha, explicación)."""
+    if not fechas:
+        return hoy + timedelta(days=3), "Los recibos no traen fecha legible: se usa hoy + 3 días."
+    mas_cercana = min(fechas)
+    if mas_cercana < hoy:
+        return hoy + timedelta(days=3), f"El vencimiento más próximo ({format_fecha(mas_cercana)}) ya pasó: se usa hoy + 3 días."
+    return mas_cercana, f"Vencimiento más próximo entre los recibos cargados ({len(fechas)} con fecha)."
+
 # Total real: código de barras GS1-128, AI (3900) = valor a pagar. Toda factura
 # electrónica de servicios públicos en Colombia lo trae en texto plano.
 def extract_barcode_total(text: str):
@@ -99,12 +171,13 @@ def parse_pdf_file(filename: str, file_bytes: bytes):
         service = "AGUA"
         empresa = "Acueducto de Bogotá (EAAB)"
 
-    fecha_val = extract_date(full_text)
+    fecha_dt = extract_fecha_pago(service, full_text)
     total_barra = extract_barcode_total(full_text)
     all_amounts = find_cop_amounts(full_text)
 
     res = {
-        "service": service, "empresa": empresa, "filename": filename, "fecha": fecha_val,
+        "service": service, "empresa": empresa, "filename": filename,
+        "fecha_dt": fecha_dt, "fecha": format_fecha(fecha_dt) if fecha_dt else "",
         "total": 0.0, "energia": 0.0, "aseo": 0.0, "gas": 0.0, "agua": 0.0,
         "aviso": "", "char_count": len(full_text.strip())
     }
@@ -274,7 +347,6 @@ val_energia = 0.0
 val_aseo = 0.0
 val_gas = 0.0
 val_agua = 0.0
-fecha_pago = "10 Sep. 2026"
 recibos_procesados = []
 
 if uploaded_files:
@@ -287,16 +359,10 @@ if uploaded_files:
         if p["service"] == "ENERGIA":
             val_energia = p["energia"]
             val_aseo = p["aseo"]
-            if p["fecha"]:
-                fecha_pago = p["fecha"]
         elif p["service"] == "GAS":
             val_gas = p["gas"]
-            if p["fecha"]:
-                fecha_pago = p["fecha"]
         elif p["service"] == "AGUA":
             val_agua = p["agua"]
-            if p["fecha"]:
-                fecha_pago = p["fecha"]
 
     st.write("### Estado de lectura de archivos:")
     for r in recibos_procesados:
@@ -310,6 +376,11 @@ if uploaded_files:
         else:
             st.warning(f"⚠️ **{r['filename']}**: No se reconoció automáticamente. Caracteres leídos: {r['char_count']}")
 
+hoy = hoy_bogota()
+fechas_recibos = [r["fecha_dt"] for r in recibos_procesados if r.get("fecha_dt")]
+fecha_limite_dt, nota_fecha = calcular_fecha_limite(fechas_recibos, hoy)
+fecha_pago = format_fecha(fecha_limite_dt)
+
 st.write("---")
 
 col_izq, col_der = st.columns(2)
@@ -317,6 +388,10 @@ col_izq, col_der = st.columns(2)
 with col_izq:
     st.subheader("1. Valores Detectados")
     fecha_val = st.text_input("Fecha Límite de Pago a mostrar", value=fecha_pago)
+    if recibos_procesados:
+        st.caption(nota_fecha)
+    else:
+        st.caption("Sin recibos cargados: se propone hoy + 3 días. Puedes editarla.")
 
     m1, m2 = st.columns(2)
     m1.metric("Energía Enel", format_cop(val_energia))
